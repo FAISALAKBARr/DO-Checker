@@ -631,7 +631,7 @@ def api_retry():
         return jsonify({'error': 'raw_data dan img_b64 wajib diisi'}), 400
 
     try:
-        model    = genai.GenerativeModel('gemini-1.5-flash')
+        model    = genai.GenerativeModel('gemini-2.5-flash')
         img_part = {'inline_data': {'mime_type': 'image/jpeg', 'data': img_b64}}
 
         response  = model.generate_content(
