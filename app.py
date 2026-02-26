@@ -206,7 +206,7 @@ def preprocess_image(image_bytes: bytes) -> bytes:
 
     # 1. Resize — min lebar 1800px, jaga aspek rasio
     w, h = img.size
-    MIN_WIDTH = 1800
+    MIN_WIDTH = 1200
     if w < MIN_WIDTH:
         scale = MIN_WIDTH / w
         new_w = int(w * scale)
@@ -690,4 +690,5 @@ def api_validate():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
