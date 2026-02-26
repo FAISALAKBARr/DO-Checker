@@ -576,7 +576,7 @@ def api_extract():
         return jsonify({'error': f'Format .{ext} tidak didukung'}), 400
 
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
 
         raw_bytes       = file.read()
         processed_bytes = preprocess_image(raw_bytes)
