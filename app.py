@@ -187,44 +187,31 @@ Kembalikan HANYA JSON murni dengan format yang SAMA persis seperti sebelumnya:
 # ══════════════════════════════════════════════════════════════════
 def preprocess_image(image_bytes: bytes) -> bytes:
     """
-    Meningkatkan kualitas gambar untuk membantu Gemini membaca
-    tulisan tangan lebih akurat, terutama digit yang mirip (4 vs 9, dll).
-
-    Langkah:
-    1. Resize ke lebar minimum 1800px agar digit tidak buram
-    2. Tingkatkan kontras → batas antara tinta dan kertas lebih tegas
-    3. Tingkatkan ketajaman → tepi huruf lebih crisp
-    4. Slight brightness boost → dokumen yang agak gelap jadi lebih terbaca
+    Preprocess gambar untuk Gemini.
+    Railway-safe: hanya DOWNSCALE (tidak upscale), JPEG quality rendah,
+    agar payload kecil dan pemrosesan cepat.
     """
     img = Image.open(io.BytesIO(image_bytes))
 
-    # Konversi mode non-RGB
-    if img.mode in ('RGBA', 'LA', 'P'):
-        img = img.convert('RGB')
-    elif img.mode != 'RGB':
+    # Konversi ke RGB
+    if img.mode != 'RGB':
         img = img.convert('RGB')
 
-    # 1. Resize — min lebar 1800px, jaga aspek rasio
+    # Downscale saja jika lebih besar dari 1600px — JANGAN upscale
+    # (upscale hanya memperbesar file tanpa menambah informasi)
+    MAX_WIDTH = 1600
     w, h = img.size
-    MIN_WIDTH = 1200
-    if w < MIN_WIDTH:
-        scale = MIN_WIDTH / w
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
+    if w > MAX_WIDTH:
+        scale = MAX_WIDTH / w
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # 2. Tingkatkan kontras (1.0 = original, 2.0 = 2x lebih kontras)
-    img = ImageEnhance.Contrast(img).enhance(1.8)
+    # Enhance ringan — hindari operasi berat
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    img = ImageEnhance.Sharpness(img).enhance(1.8)
 
-    # 3. Tingkatkan ketajaman
-    img = ImageEnhance.Sharpness(img).enhance(2.5)
-
-    # 4. Sedikit naikkan brightness untuk dokumen yang terkesan abu-abu
-    img = ImageEnhance.Brightness(img).enhance(1.05)
-
-    # Simpan dengan kualitas tinggi
+    # Quality 80 — cukup untuk OCR, jauh lebih kecil dari 95
     buf = io.BytesIO()
-    img.save(buf, format='JPEG', quality=95)
+    img.save(buf, format='JPEG', quality=80, optimize=True)
     return buf.getvalue()
 
 
@@ -572,9 +559,10 @@ def index():
 def api_extract():
     """
     Step 1: Kirim gambar ke Gemini → ekstrak data mentah.
-    - Gambar di-preprocess dulu untuk meningkatkan akurasi baca digit.
-    - Jika validasi awal gagal, otomatis retry dengan prompt khusus.
-    - Kembalikan raw_data terbaik + flag ada_bruto_terra + baris_ragu.
+    SATU request = SATU Gemini call (tidak ada retry otomatis di sini).
+    Retry manual tersedia di /api/retry dan dipanggil oleh frontend jika diperlukan.
+    img_b64 dari gambar yang sudah dipreprocess ikut dikembalikan agar
+    /api/retry tidak perlu menerima file ulang.
     """
     if 'file' not in request.files:
         return jsonify({'error': 'Tidak ada file yang dikirim'}), 400
@@ -588,79 +576,92 @@ def api_extract():
         return jsonify({'error': f'Format .{ext} tidak didukung'}), 400
 
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash')
 
-        # ── Preprocessing gambar ──────────────────────────────────
-        raw_bytes        = file.read()
-        processed_bytes  = preprocess_image(raw_bytes)
-        img_b64          = base64.b64encode(processed_bytes).decode()
-        img_part         = {'inline_data': {'mime_type': 'image/jpeg', 'data': img_b64}}
+        raw_bytes       = file.read()
+        processed_bytes = preprocess_image(raw_bytes)
+        img_b64         = base64.b64encode(processed_bytes).decode()
+        img_part        = {'inline_data': {'mime_type': 'image/jpeg', 'data': img_b64}}
 
-        # ── Pass 1: Baca normal ───────────────────────────────────
-        response1  = model.generate_content([img_part, EXTRACTION_PROMPT])
-        raw_data1  = extract_json(response1.text)
-        ada_bt1    = any(grp_pakai_bruto_terra(g) for g in raw_data1.get('kelompok', []))
+        response = model.generate_content(
+            [img_part, EXTRACTION_PROMPT],
+            request_options={'timeout': 50},
+        )
+        raw_data = extract_json(response.text)
 
-        # Validasi sementara (tanpa bandul jika tidak diperlukan)
-        bandul_tmp = None
-        if not ada_bt1:
-            result1        = validate_do(raw_data1, bandul=None)
-            checks_gagal1  = [c for c in result1['checks'] if not c['ok']]
-        else:
-            # Ada bruto/terra → belum bisa validasi penuh tanpa bandul,
-            # skip retry, langsung kembalikan hasil pass 1
-            checks_gagal1 = []
-
-        # ── Pass 2: Retry jika ada yang gagal ────────────────────
-        raw_data_final = raw_data1
-        retry_dilakukan = False
-
-        if checks_gagal1:
-            retry_prompt = buat_retry_prompt(checks_gagal1, raw_data1)
-            response2    = model.generate_content([img_part, retry_prompt])
-
-            try:
-                raw_data2 = extract_json(response2.text)
-                result2   = validate_do(raw_data2, bandul=None)
-
-                jumlah_benar1 = sum(1 for c in result1['checks'] if c['ok'])
-                jumlah_benar2 = sum(1 for c in result2['checks'] if c['ok'])
-
-                # Pakai hasil yang lebih banyak benarnya
-                if jumlah_benar2 > jumlah_benar1:
-                    raw_data_final  = raw_data2
-                    retry_dilakukan = True
-            except Exception:
-                # Retry gagal parse → tetap pakai pass 1
-                pass
-
-        # ── Kumpulkan semua baris yang ditandai ragu ──────────────
-        baris_ragu = []
-        for grp in raw_data_final.get('kelompok', []):
-            for r in grp.get('baris', []):
-                if r.get('ragu'):
-                    baris_ragu.append({
-                        'kelompok': grp.get('nama', ''),
-                        'posisi':   grp.get('posisi', ''),
-                        'no':       r.get('no'),
-                        'ekor':     r.get('ekor'),
-                        'kg':       r.get('kg'),
-                    })
-
-        ada_bt_final = any(grp_pakai_bruto_terra(g) for g in raw_data_final.get('kelompok', []))
+        baris_ragu = [
+            {'kelompok': grp.get('nama',''), 'posisi': grp.get('posisi',''),
+             'no': r.get('no'), 'ekor': r.get('ekor'), 'kg': r.get('kg')}
+            for grp in raw_data.get('kelompok', [])
+            for r   in grp.get('baris', [])
+            if r.get('ragu')
+        ]
+        ada_bt = any(grp_pakai_bruto_terra(g) for g in raw_data.get('kelompok', []))
 
         return jsonify({
-            'success':          True,
-            'raw_data':         raw_data_final,
-            'ada_bruto_terra':  ada_bt_final,
-            'baris_ragu':       baris_ragu,
-            'retry_dilakukan':  retry_dilakukan,
+            'success':         True,
+            'raw_data':        raw_data,
+            'ada_bruto_terra': ada_bt,
+            'baris_ragu':      baris_ragu,
+            'retry_dilakukan': False,
+            'img_b64':         img_b64,   # disimpan di frontend untuk /api/retry
         })
 
     except json.JSONDecodeError as e:
         return jsonify({'error': f'Gagal parsing respons Gemini: {str(e)}'}), 500
     except Exception as e:
         return jsonify({'error': f'Terjadi kesalahan: {str(e)}'}), 500
+
+
+@app.route('/api/retry', methods=['POST'])
+def api_retry():
+    """
+    Retry OCR — dipanggil frontend secara OPSIONAL setelah validasi awal gagal.
+    Endpoint terpisah sehingga tiap request ke Gemini tetap 1 call.
+    """
+    body = request.get_json()
+    if not body:
+        return jsonify({'error': 'Body kosong'}), 400
+
+    raw_data_lama = body.get('raw_data')
+    checks_gagal  = body.get('checks_gagal', [])
+    img_b64       = body.get('img_b64')
+
+    if not raw_data_lama or not img_b64:
+        return jsonify({'error': 'raw_data dan img_b64 wajib diisi'}), 400
+
+    try:
+        model    = genai.GenerativeModel('gemini-1.5-flash')
+        img_part = {'inline_data': {'mime_type': 'image/jpeg', 'data': img_b64}}
+
+        response  = model.generate_content(
+            [img_part, buat_retry_prompt(checks_gagal, raw_data_lama)],
+            request_options={'timeout': 50},
+        )
+        raw_data2 = extract_json(response.text)
+
+        baris_ragu = [
+            {'kelompok': grp.get('nama',''), 'posisi': grp.get('posisi',''),
+             'no': r.get('no'), 'ekor': r.get('ekor'), 'kg': r.get('kg')}
+            for grp in raw_data2.get('kelompok', [])
+            for r   in grp.get('baris', [])
+            if r.get('ragu')
+        ]
+        ada_bt = any(grp_pakai_bruto_terra(g) for g in raw_data2.get('kelompok', []))
+
+        return jsonify({
+            'success':         True,
+            'raw_data':        raw_data2,
+            'ada_bruto_terra': ada_bt,
+            'baris_ragu':      baris_ragu,
+            'retry_dilakukan': True,
+            'img_b64':         img_b64,
+        })
+
+    except json.JSONDecodeError as e:
+        return jsonify({'error': f'Gagal parsing respons Gemini retry: {str(e)}'}), 500
+    except Exception as e:
+        return jsonify({'error': f'Terjadi kesalahan retry: {str(e)}'}), 500
 
 
 @app.route('/api/validate', methods=['POST'])

@@ -1298,6 +1298,62 @@
         </div>
 
         <div class="sec-label">HASIL VERIFIKASI & RINCIAN PERHITUNGAN</div>
+        <!-- Tombol OCR retry — muncul jika ada hasil yang salah dan imgB64 tersedia -->
+        <div
+          id="ocr-retry-bar"
+          style="
+            display: none;
+            margin-bottom: 16px;
+            background: var(--blue-bg);
+            border: 1.5px solid var(--blue);
+            border-radius: 6px;
+            padding: 14px 18px;
+            display: none;
+            gap: 14px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+          "
+        >
+          <div style="flex: 1; min-width: 180px">
+            <strong
+              style="
+                font-size: 13px;
+                color: var(--blue);
+                display: block;
+                margin-bottom: 3px;
+              "
+              >Ada ketidaksesuaian — coba baca ulang dokumen?</strong
+            >
+            <span
+              style="
+                font-size: 11px;
+                font-family: var(--mono);
+                color: var(--muted2);
+              "
+              >Gemini akan membaca gambar sekali lagi dengan fokus pada digit
+              yang kemungkinan salah baca.</span
+            >
+          </div>
+          <button
+            id="btn-ocr-retry"
+            style="
+              padding: 9px 18px;
+              background: var(--blue);
+              color: #000;
+              border: none;
+              font-family: var(--mono);
+              font-size: 11px;
+              font-weight: 700;
+              letter-spacing: 0.08em;
+              cursor: pointer;
+              border-radius: 4px;
+              white-space: nowrap;
+              flex-shrink: 0;
+            "
+          >
+            🔄 BACA ULANG OLEH AI
+          </button>
+        </div>
         <div class="checks-list" id="checks-list"></div>
 
         <div class="sec-label">KOREKSI NILAI EKSTRAKSI</div>
@@ -1341,8 +1397,10 @@
       let selectedFile = null;
       let rawData = null;
       let adaBrutoTerra = false;
-      let barisRagu = []; // baris yang ditandai ragu oleh Gemini
-      let currentBandul = null; // bandul yang terakhir dipakai, untuk recalc
+      let barisRagu = [];
+      let currentBandul = null;
+      let retryDilakukan = false;
+      let imgB64 = null; // gambar preproc hasil /api/extract, dipakai ulang di /api/retry
 
       /* ══ DOM ══ */
       const fileInput = document.getElementById("file-input");
@@ -1448,6 +1506,7 @@
           adaBrutoTerra = json.ada_bruto_terra;
           barisRagu = json.baris_ragu || [];
           retryDilakukan = json.retry_dilakukan || false;
+          imgB64 = json.img_b64 || null;
 
           if (adaBrutoTerra) {
             // Tampilkan step 2 bandul
@@ -1493,8 +1552,8 @@
         await doValidate(bandul);
       });
 
-      async function doValidate(bandul) {
-        currentBandul = bandul; // simpan untuk recalc nanti
+      async function doValidate(bandul, setelahRetry = false) {
+        currentBandul = bandul;
         setLoading(
           true,
           "Menghitung ulang semua nilai...",
@@ -1522,6 +1581,19 @@
           document.getElementById("step1-section").style.display = "none";
           bandulSection.style.display = "none";
           renderResults(json.result, barisRagu, retryDilakukan);
+
+          // Tampilkan tombol OCR retry jika ada yang gagal, ada imgB64, dan belum retry
+          const ocrBar = document.getElementById("ocr-retry-bar");
+          if (
+            !json.result.semua_benar &&
+            imgB64 &&
+            !setelahRetry &&
+            !retryDilakukan
+          ) {
+            ocrBar.style.display = "flex";
+          } else {
+            ocrBar.style.display = "none";
+          }
         } catch (e) {
           setLoading(false);
           showError("error-step1", "Gagal: " + e.message);
@@ -1531,12 +1603,11 @@
       /* ══ RESET ══ */
       btnReset.addEventListener("click", () => {
         selectedFile = null;
-        rawData = null;
         adaBrutoTerra = false;
         barisRagu = [];
         retryDilakukan = false;
         currentBandul = null;
-        if (rawData && rawData._extEdits) delete rawData._extEdits;
+        imgB64 = null;
         rawData = null;
         fileInput.value = "";
         previewWrap.style.display = "none";
@@ -1547,6 +1618,8 @@
         bandulPreview.innerHTML = "<span>—</span>";
         btnValidate.disabled = true;
         results.style.display = "none";
+        document.getElementById("ocr-retry-bar").style.display = "none";
+        document.getElementById("recalc-bar").style.display = "none";
         const epw = document.getElementById("ext-panel-wrap");
         if (epw) epw.innerHTML = "";
         const oldRaguWarn = document.getElementById("ragu-warning");
@@ -2389,7 +2462,77 @@
           }
         });
 
-      /* Batalkan semua perubahan */
+      /* ══ OCR RETRY (baca ulang AI — panggil /api/retry terpisah) ══ */
+      document
+        .getElementById("btn-ocr-retry")
+        .addEventListener("click", async () => {
+          if (!imgB64 || !rawData) return;
+
+          // Ambil checks yang gagal dari hasil validasi terakhir
+          const checkCards = [...document.querySelectorAll(".check-card.err")];
+          // Kumpulkan info minimal untuk retry prompt
+          const checksGagal = checkCards.map((card) => {
+            // Ambil teks dari card — cukup untuk retry prompt
+            const label = card.querySelector(".cc-label")?.textContent || "";
+            const hitung =
+              parseFloat(card.querySelector(".cc-num.h .val")?.textContent) ||
+              0;
+            const tertulis =
+              parseFloat(card.querySelector(".cc-num.t .val")?.textContent) ||
+              0;
+            const satuan =
+              card.querySelector(".cc-num.h .val span")?.textContent?.trim() ||
+              "";
+            return {
+              label,
+              hitung,
+              tertulis,
+              selisih: hitung - tertulis,
+              satuan,
+            };
+          });
+
+          document.getElementById("ocr-retry-bar").style.display = "none";
+          setLoading(
+            true,
+            "Membaca ulang dokumen dengan AI...",
+            "Fokus pada digit yang mungkin salah baca...",
+          );
+          document.getElementById("results").style.display = "none";
+
+          try {
+            const res = await fetch("/api/retry", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                raw_data: rawData,
+                checks_gagal: checksGagal,
+                img_b64: imgB64,
+              }),
+            });
+            const json = await res.json();
+            setLoading(false);
+
+            if (!json.success) {
+              showError("error-step1", "Gagal baca ulang: " + json.error);
+              document.getElementById("results").style.display = "block";
+              return;
+            }
+
+            rawData = json.raw_data;
+            adaBrutoTerra = json.ada_bruto_terra;
+            barisRagu = json.baris_ragu || [];
+            retryDilakukan = json.retry_dilakukan || false;
+            imgB64 = json.img_b64 || imgB64;
+
+            // Validasi ulang dengan data baru
+            await doValidate(currentBandul, true /* setelahRetry */);
+          } catch (e) {
+            setLoading(false);
+            showError("error-step1", "Gagal: " + e.message);
+            document.getElementById("results").style.display = "block";
+          }
+        });
       document
         .getElementById("recalc-discard")
         .addEventListener("click", () => {
